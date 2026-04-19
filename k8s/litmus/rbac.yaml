@@ -1,0 +1,72 @@
+# LitmusChaos RBAC — apply this before running experiments
+# kubectl apply -f k8s/litmus/rbac.yaml
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: litmus-admin
+  namespace: default
+  labels:
+    app: ai-chaos-engineer
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: litmus-admin
+  labels:
+    app: ai-chaos-engineer
+rules:
+  # Core resources
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - pods/exec
+      - events
+      - services
+      - nodes
+      - configmaps
+      - secrets
+      - persistentvolumeclaims
+      - replicationcontrollers
+    verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
+  # Apps
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - statefulsets
+      - daemonsets
+      - replicasets
+    verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
+  # Batch
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # LitmusChaos CRDs
+  - apiGroups: ["litmuschaos.io"]
+    resources:
+      - chaosengines
+      - chaosexperiments
+      - chaosresults
+    verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
+  # Node operations (for node-drain)
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "patch", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: litmus-admin
+  labels:
+    app: ai-chaos-engineer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: litmus-admin
+subjects:
+  - kind: ServiceAccount
+    name: litmus-admin
+    namespace: default

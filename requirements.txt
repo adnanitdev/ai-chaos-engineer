@@ -1,0 +1,15 @@
+anthropic>=0.25.0
+openai>=1.30.0
+kubernetes>=29.0.0
+prometheus-api-client>=0.5.4
+PyYAML>=6.0.1
+python-dotenv>=1.0.1
+jinja2>=3.1.4
+requests>=2.32.0
+rich>=13.7.0
+click>=8.1.7
+tabulate>=0.9.0
+reportlab>=4.2.0
+slack-sdk>=3.29.0
+pydantic>=2.7.0
+tenacity>=8.3.0

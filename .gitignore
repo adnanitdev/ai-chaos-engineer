@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+reports/
+*.cast
+config.local.yaml
+.DS_Store

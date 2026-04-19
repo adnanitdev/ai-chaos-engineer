@@ -1,0 +1,48 @@
+# AI Chaos Engineer — Configuration
+# Copy this to config.local.yaml and fill in your values
+
+ai:
+  provider: "anthropic"        # "anthropic" | "openai"
+  anthropic_model: "claude-opus-4-5"
+  openai_model: "gpt-4o"
+  max_tokens: 4096
+  temperature: 0.2
+
+kubernetes:
+  context: ""                  # leave empty to use current kubeconfig context
+  namespace: "default"         # target namespace (or "all" to scan all)
+  kubeconfig: "~/.kube/config"
+
+chaos:
+  dry_run: false               # set true to plan without executing
+  auto_rollback: true          # auto-cleanup on SLO breach
+  max_duration_seconds: 300    # max experiment duration
+  cooldown_seconds: 60         # wait between experiments
+  experiments_enabled:
+    - pod_kill
+    - network_latency
+    - network_partition
+    - cpu_stress
+    - memory_stress
+    - node_drain
+
+slo:                           # abort thresholds
+  error_rate_percent: 5.0
+  latency_p99_ms: 2000
+  pod_restart_limit: 3
+
+prometheus:
+  url: "http://localhost:9090"
+  scrape_interval_seconds: 5
+
+slack:
+  enabled: false
+  webhook_url: ""
+  channel: "#chaos-reports"
+
+reporting:
+  output_dir: "./reports"
+  formats:
+    - "markdown"
+    - "pdf"
+    - "slack"
