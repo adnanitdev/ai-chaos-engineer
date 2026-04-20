@@ -68,7 +68,7 @@ cp .env.example .env
 ### 1. Install LitmusChaos
 
 ```bash
-kubectl apply -f https://litmuschaos.github.io/litmus/litmus-operator-v3.0.0.yaml
+kubectl apply -f https://litmuschaos.github.io/litmus/litmus-operator-v3.28.0.yaml
 kubectl apply -f k8s/litmus/rbac.yaml
 kubectl apply -f k8s/litmus/experiments.yaml
 ```
