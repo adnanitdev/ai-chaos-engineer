@@ -68,7 +68,7 @@ cp .env.example .env
 ### 1. Install LitmusChaos
 
 ```bash
-kubectl apply -f https://litmuschaos.github.io/litmus/litmus-operator-v3.0.0.yaml
+kubectl apply -f https://litmuschaos.github.io/litmus/litmus-operator-v3.28.0.yaml
 kubectl apply -f k8s/litmus/rbac.yaml
 kubectl apply -f k8s/litmus/experiments.yaml
 ```
@@ -222,20 +222,3 @@ ai-chaos-engineer/
 - **Cooldown** — configurable wait between experiments
 
 ---
-
-## LinkedIn Post Demo
-
-Want the viral LinkedIn post? Run a full chaos session and record with [asciinema](https://asciinema.org/):
-
-```bash
-asciinema rec chaos-demo.cast
-python main.py run --skip-confirm
-# Ctrl+D to stop recording
-asciinema play chaos-demo.cast
-```
-
----
-
-## License
-
-MIT
