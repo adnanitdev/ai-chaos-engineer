@@ -8,3 +8,4 @@ reports/
 *.cast
 config.local.yaml
 .DS_Store
+venv
