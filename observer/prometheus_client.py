@@ -1,16 +1,12 @@
 """
 observer/prometheus_client.py
-Uses only metrics guaranteed on EKS with kube-prometheus-stack:
-  - container_cpu_usage_seconds_total         (cAdvisor)
-  - container_memory_working_set_bytes        (cAdvisor)
-  - container_network_transmit_bytes_total    (cAdvisor)
-  - kube_pod_container_status_restarts_total  (kube-state-metrics)
-  - kube_deployment_status_replicas_available (kube-state-metrics)
-  - kube_deployment_spec_replicas             (kube-state-metrics)
-
-NOTE: http_requests_total and http_request_duration_seconds_bucket are NOT
-used because httpbin/nginx do not export them. All scoring uses cAdvisor
-and kube-state-metrics which are always present on kube-prometheus-stack.
+Uses metrics that actually capture chaos on fast-recovering EKS clusters.
+Key insight: pods recover in <10s so availability never drops in Prometheus.
+Instead we measure:
+  - pod churn rate (new pod creations during experiment window)
+  - CPU spike during stress
+  - network drop during partition
+  - kube_pod_status_phase transitions
 """
 from __future__ import annotations
 import time
@@ -25,78 +21,60 @@ class PrometheusClient:
         self.base_url = cfg["prometheus"]["url"].rstrip("/")
         self.timeout = 10
 
-    # ------------------------------------------------------------------
-    # Public metric queries
-    # ------------------------------------------------------------------
-
-    def query_error_rate(self, namespace: str, workload: str) -> Optional[float]:
+    def query_pod_churn(self, namespace: str, workload: str) -> float:
         """
-        Restart rate per minute — proxy for error rate.
-        Spikes immediately when pods crash/OOMKill during experiments.
-        Returns 0.0 (not None) so scoring always has a value to compare.
+        Counts how many times pods were recreated in last 10 minutes.
+        Each pod kill creates a new pod with a new name — this counter goes up.
+        Uses kube_pod_created timestamp to detect new pod appearances.
         """
         q = (
-            f'sum(rate(kube_pod_container_status_restarts_total{{'
-            f'namespace="{namespace}",pod=~"{workload}-.*"}}[5m])) * 60'
+            f'count(time() - kube_pod_created{{namespace="{namespace}",'
+            f'pod=~"{workload}-.*"}} < 600)'
         )
-        return self._scalar_or_zero(q)
+        result = self._scalar(q)
+        return result if result is not None else 0.0
 
-    def query_latency_p99(self, namespace: str, workload: str) -> Optional[float]:
-        """
-        CPU saturation in millicores — proxy for latency pressure.
-        Spikes during cpu_stress experiments.
-        """
+    def query_pod_restarts(self, namespace: str, workload: str) -> float:
         q = (
-            f'sum(rate(container_cpu_usage_seconds_total{{'
-            f'namespace="{namespace}",pod=~"{workload}-.*",container!=""}}[2m])) * 1000'
+            f'sum(kube_pod_container_status_restarts_total{{'
+            f'namespace="{namespace}",pod=~"{workload}-.*"}})'
         )
-        return self._scalar_or_zero(q)
+        result = self._scalar(q)
+        return result if result is not None else 0.0
 
-    def query_pod_restarts(self, namespace: str, workload: str) -> Optional[float]:
-        """Pod restart count over last 5 minutes. Spikes on pod kill."""
-        q = (
-            f'sum(increase(kube_pod_container_status_restarts_total{{'
-            f'namespace="{namespace}",pod=~"{workload}-.*"}}[5m]))'
-        )
-        return self._scalar_or_zero(q)
-
-    def query_cpu_usage(self, namespace: str, workload: str) -> Optional[float]:
-        """CPU usage in millicores."""
+    def query_cpu_usage(self, namespace: str, workload: str) -> float:
         q = (
             f'sum(rate(container_cpu_usage_seconds_total{{'
             f'namespace="{namespace}",pod=~"{workload}-.*",container!=""}}[2m])) * 1000'
         )
-        return self._scalar_or_zero(q)
+        result = self._scalar(q)
+        return result if result is not None else 0.0
 
-    def query_memory_usage_mb(self, namespace: str, workload: str) -> Optional[float]:
-        """Memory usage in MB."""
+    def query_memory_usage_mb(self, namespace: str, workload: str) -> float:
         q = (
             f'sum(container_memory_working_set_bytes{{'
             f'namespace="{namespace}",pod=~"{workload}-.*",container!=""}}) / 1024 / 1024'
         )
-        return self._scalar_or_zero(q)
+        result = self._scalar(q)
+        return result if result is not None else 0.0
 
-    def query_network_bytes_per_sec(self, namespace: str, workload: str) -> Optional[float]:
-        """
-        Network transmit bytes/sec.
-        Drops sharply during network_partition and network_latency experiments.
-        """
+    def query_network_bytes_per_sec(self, namespace: str, workload: str) -> float:
         q = (
             f'sum(rate(container_network_transmit_bytes_total{{'
             f'namespace="{namespace}",pod=~"{workload}-.*"}}[2m]))'
         )
-        return self._scalar_or_zero(q)
+        result = self._scalar(q)
+        return result if result is not None else 0.0
 
-    def query_ready_replicas(self, namespace: str, workload: str) -> Optional[float]:
-        """Ready replicas. Drops to 0 immediately on pod kill."""
+    def query_ready_replicas(self, namespace: str, workload: str) -> float:
         q = (
             f'kube_deployment_status_replicas_available{{'
             f'namespace="{namespace}",deployment="{workload}"}}'
         )
-        return self._scalar_or_zero(q)
+        result = self._scalar(q)
+        return result if result is not None else 0.0
 
-    def query_desired_replicas(self, namespace: str, workload: str) -> Optional[float]:
-        """Desired replica count from deployment spec."""
+    def query_desired_replicas(self, namespace: str, workload: str) -> float:
         q = (
             f'kube_deployment_spec_replicas{{'
             f'namespace="{namespace}",deployment="{workload}"}}'
@@ -104,27 +82,52 @@ class PrometheusClient:
         result = self._scalar(q)
         return result if result is not None else 1.0
 
+    def query_pods_not_running(self, namespace: str, workload: str) -> float:
+        """
+        Counts pods NOT in Running phase — catches the brief window when
+        pods are Pending/ContainerCreating after being killed.
+        """
+        q = (
+            f'count(kube_pod_status_phase{{namespace="{namespace}",'
+            f'pod=~"{workload}-.*",phase!="Running"}} == 1) or vector(0)'
+        )
+        result = self._scalar(q)
+        return result if result is not None else 0.0
+
+    def query_error_rate(self, namespace: str, workload: str) -> float:
+        # proxy: restart rate per minute
+        q = (
+            f'sum(rate(kube_pod_container_status_restarts_total{{'
+            f'namespace="{namespace}",pod=~"{workload}-.*"}}[5m])) * 60'
+        )
+        result = self._scalar(q)
+        return result if result is not None else 0.0
+
+    def query_latency_p99(self, namespace: str, workload: str) -> float:
+        # proxy: CPU saturation
+        return self.query_cpu_usage(namespace, workload)
+
     def snapshot(self, namespace: str, workload: str) -> dict:
-        """Full metrics snapshot for a workload. All values default to 0.0, never None."""
         ready   = self.query_ready_replicas(namespace, workload)
         desired = self.query_desired_replicas(namespace, workload)
-        avail_pct = round((ready / desired * 100), 1) if desired and desired > 0 else 100.0
+        avail_pct = round((ready / desired * 100), 1) if desired > 0 else 100.0
 
         return {
-            "timestamp":         time.time(),
-            "error_rate_pct":    self.query_error_rate(namespace, workload),
-            "latency_p99_ms":    self.query_latency_p99(namespace, workload),
-            "pod_restarts":      self.query_pod_restarts(namespace, workload),
-            "cpu_millicores":    self.query_cpu_usage(namespace, workload),
-            "memory_mb":         self.query_memory_usage_mb(namespace, workload),
-            "network_bytes_sec": self.query_network_bytes_per_sec(namespace, workload),
-            "ready_replicas":    ready,
-            "desired_replicas":  desired,
-            "availability_pct":  avail_pct,
+            "timestamp":          time.time(),
+            "error_rate_pct":     self.query_error_rate(namespace, workload),
+            "latency_p99_ms":     self.query_latency_p99(namespace, workload),
+            "pod_restarts":       self.query_pod_restarts(namespace, workload),
+            "pod_churn":          self.query_pod_churn(namespace, workload),
+            "pods_not_running":   self.query_pods_not_running(namespace, workload),
+            "cpu_millicores":     self.query_cpu_usage(namespace, workload),
+            "memory_mb":          self.query_memory_usage_mb(namespace, workload),
+            "network_bytes_sec":  self.query_network_bytes_per_sec(namespace, workload),
+            "ready_replicas":     ready,
+            "desired_replicas":   desired,
+            "availability_pct":   avail_pct,
         }
 
     def range_query(self, promql: str, start: float, end: float, step: str = "15s") -> list[dict]:
-        """Raw range query — returns list of {timestamp, value} dicts."""
         resp = self._get("/api/v1/query_range", {
             "query": promql, "start": start, "end": end, "step": step,
         })
@@ -137,10 +140,6 @@ class PrometheusClient:
                     pass
         return results
 
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
     def _scalar(self, query: str) -> Optional[float]:
         resp = self._get("/api/v1/query", {"query": query})
         results = resp.get("data", {}).get("result", [])
@@ -150,11 +149,6 @@ class PrometheusClient:
             return float(results[0]["value"][1])
         except (IndexError, KeyError, ValueError, TypeError):
             return None
-
-    def _scalar_or_zero(self, query: str) -> float:
-        """Like _scalar but returns 0.0 instead of None — ensures scoring always has data."""
-        result = self._scalar(query)
-        return result if result is not None else 0.0
 
     def _get(self, path: str, params: dict) -> dict:
         try:

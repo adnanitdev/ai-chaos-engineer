@@ -1,17 +1,11 @@
 """
 observer/impact_scorer.py
-Scores experiments using metrics that actually exist on EKS.
 
-Scoring signals by experiment type:
-  pod_kill          → availability_pct drop + pod_restarts spike
-  cpu_stress        → cpu_millicores spike
-  memory_stress     → memory_mb spike + cpu_millicores spike
-  network_latency   → network_bytes_sec drop
-  network_partition → network_bytes_sec drop + availability_pct drop
-  node_drain        → availability_pct drop across multiple workloads
+Uses min_over_time range queries to capture disruption that recovers
+faster than the Prometheus scrape interval (15s).
 """
 from __future__ import annotations
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 import json
 import time
 from observer.prometheus_client import PrometheusClient
@@ -40,8 +34,8 @@ class ImpactReport:
     deltas: list[MetricDelta]
     slo_breached: bool
     slo_breach_reason: str
-    resilience_score: int        # 0-100 (100 = no measurable impact)
-    verdict: str                 # "pass" | "degraded" | "failed"
+    resilience_score: int
+    verdict: str
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -58,7 +52,6 @@ class ImpactScorer:
         self.slo = cfg["slo"]
 
     def take_baseline(self, experiment: ExperimentPlan) -> dict:
-        """Call this BEFORE the experiment starts."""
         return self.prom.snapshot(experiment.target_namespace, experiment.target_workload)
 
     def score(
@@ -69,12 +62,14 @@ class ImpactScorer:
         end_time: float,
         slo_breach_reason: str = "",
     ) -> ImpactReport:
-        """Call this AFTER the experiment ends."""
-        time.sleep(5)  # let metrics settle
+        time.sleep(5)
         after = self.prom.snapshot(experiment.target_namespace, experiment.target_workload)
-
         deltas = self._compute_deltas(baseline, after)
-        resilience_score = self._compute_score(deltas, bool(slo_breach_reason), experiment.kind)
+        resilience_score = self._compute_score(
+            deltas, bool(slo_breach_reason), experiment.kind,
+            experiment.target_namespace, experiment.target_workload,
+            start_time, end_time,
+        )
         verdict = self._verdict(resilience_score, bool(slo_breach_reason))
 
         return ImpactReport(
@@ -92,42 +87,29 @@ class ImpactScorer:
             verdict=verdict,
         )
 
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
     def _compute_deltas(self, before: dict, after: dict) -> list[MetricDelta]:
         metrics = [
-            # (metric_key,        slo_config_key,       availability_invert)
-            ("availability_pct",  None,                  True),   # lower = worse
-            ("pod_restarts",      "pod_restart_limit",   False),
-            ("cpu_millicores",    None,                  False),
-            ("memory_mb",         None,                  False),
-            ("network_bytes_sec", None,                  False),  # lower = disrupted
-            ("error_rate_pct",    "error_rate_percent",  False),
+            ("availability_pct",  "availability_pct",    None),
+            ("pod_restarts",      "pod_restart_limit",   None),
+            ("cpu_millicores",    None,                  None),
+            ("memory_mb",         None,                  None),
+            ("network_bytes_sec", None,                  None),
+            ("error_rate_pct",    "error_rate_percent",  None),
         ]
         deltas = []
-        for metric_key, slo_key, avail_invert in metrics:
-            b = before.get(metric_key)
-            a = after.get(metric_key)
-            delta = None
-            delta_pct = None
-
+        for key, slo_key, _ in metrics:
+            b = before.get(key)
+            a = after.get(key)
+            delta, delta_pct = None, None
             if b is not None and a is not None:
                 delta = round(a - b, 3)
                 if b != 0:
                     delta_pct = round((delta / abs(b)) * 100, 1)
-
             breached = False
-            # SLO threshold breach (restarts, error rate)
             if slo_key and a is not None:
                 breached = a > self.slo.get(slo_key, float("inf"))
-            # Availability breach: any drop below 100% is a breach
-            if avail_invert and a is not None:
-                breached = a < 100.0
-
             deltas.append(MetricDelta(
-                metric=metric_key,
+                metric=key,
                 before=round(b, 3) if b is not None else None,
                 after=round(a, 3) if a is not None else None,
                 delta=delta,
@@ -136,61 +118,80 @@ class ImpactScorer:
             ))
         return deltas
 
-    @staticmethod
-    def _compute_score(deltas: list[MetricDelta], slo_breached: bool, kind: str) -> int:
+    def _compute_score(
+        self,
+        deltas: list[MetricDelta],
+        slo_breached: bool,
+        kind: str,
+        namespace: str,
+        workload: str,
+        start_time: float,
+        end_time: float,
+    ) -> int:
         if slo_breached:
             return 30
 
         score = 100
         dm = {d.metric: d for d in deltas}
+        window = f"{int(end_time - start_time) + 30}s"
 
-        # ── 1. Availability drop — strongest signal for pod_kill ──────
-        avail = dm.get("availability_pct")
-        if avail and avail.delta is not None:
-            drop = -avail.delta  # positive value means availability fell
-            if drop >= 50:
-                score -= 45      # e.g. 2 replicas → 1 ready = 50% drop
-            elif drop >= 25:
-                score -= 25
-            elif drop >= 1:
-                score -= 15
+        # ── pod_kill: use min_over_time to catch fast recovery ────────
+        if kind in ("pod_kill", "node_drain"):
+            min_replicas = self.prom._scalar(
+                f'min_over_time(kube_deployment_status_replicas_available{{'
+                f'namespace="{namespace}",deployment="{workload}"}}[{window}])'
+            )
+            desired = self.prom.query_desired_replicas(namespace, workload)
+            if min_replicas is not None and desired > 0:
+                min_pct = round(min_replicas / desired * 100, 1)
+                drop = 100 - min_pct
+                if drop >= 50:
+                    score -= 40
+                elif drop >= 25:
+                    score -= 25
+                elif drop >= 1:
+                    score -= 15
 
-        # ── 2. Pod restarts — direct crash evidence ───────────────────
-        restarts = dm.get("pod_restarts")
-        if restarts and restarts.delta is not None and restarts.delta > 0:
-            score -= min(30, int(restarts.delta * 10))
+        # ── cpu_stress: use max_over_time for CPU spike ───────────────
+        if kind in ("cpu_stress", "memory_stress"):
+            max_cpu = self.prom._scalar(
+                f'max_over_time(sum(rate(container_cpu_usage_seconds_total{{'
+                f'namespace="{namespace}",pod=~"{workload}-.*",container!=""}}[2m]))[{window}:15s]) * 1000'
+            )
+            baseline_cpu = dm.get("cpu_millicores")
+            if max_cpu and baseline_cpu and baseline_cpu.before and baseline_cpu.before > 0:
+                spike_pct = round((max_cpu - baseline_cpu.before) / baseline_cpu.before * 100, 1)
+                if spike_pct > 200: score -= 25
+                elif spike_pct > 100: score -= 15
+                elif spike_pct > 50: score -= 8
 
-        # ── 3. CPU spike — stress experiment signal ───────────────────
-        cpu = dm.get("cpu_millicores")
-        if cpu and cpu.delta_pct is not None and kind in ("cpu_stress", "memory_stress"):
-            if cpu.delta_pct > 200:
-                score -= 25
-            elif cpu.delta_pct > 100:
-                score -= 15
-            elif cpu.delta_pct > 50:
-                score -= 8
+        # ── memory_stress: use max_over_time for memory spike ─────────
+        if kind == "memory_stress":
+            max_mem = self.prom._scalar(
+                f'max_over_time(sum(container_memory_working_set_bytes{{'
+                f'namespace="{namespace}",pod=~"{workload}-.*",container!=""}})[{window}:15s]) / 1024 / 1024'
+            )
+            baseline_mem = dm.get("memory_mb")
+            if max_mem and baseline_mem and baseline_mem.before and baseline_mem.before > 0:
+                spike_pct = round((max_mem - baseline_mem.before) / baseline_mem.before * 100, 1)
+                if spike_pct > 100: score -= 20
+                elif spike_pct > 50: score -= 10
 
-        # ── 4. Memory spike — memory stress signal ────────────────────
-        mem = dm.get("memory_mb")
-        if mem and mem.delta_pct is not None and kind == "memory_stress":
-            if mem.delta_pct > 100:
-                score -= 20
-            elif mem.delta_pct > 50:
-                score -= 10
+        # ── network chaos: use min_over_time for traffic drop ─────────
+        if kind in ("network_latency", "network_partition"):
+            min_net = self.prom._scalar(
+                f'min_over_time(sum(rate(container_network_transmit_bytes_total{{'
+                f'namespace="{namespace}",pod=~"{workload}-.*"}}[2m]))[{window}:15s])'
+            )
+            baseline_net = dm.get("network_bytes_sec")
+            if min_net is not None and baseline_net and baseline_net.before and baseline_net.before > 0:
+                drop_pct = round((baseline_net.before - min_net) / baseline_net.before * 100, 1)
+                if drop_pct > 50: score -= 30
+                elif drop_pct > 20: score -= 15
 
-        # ── 5. Network drop — partition/latency signal ────────────────
-        net = dm.get("network_bytes_sec")
-        if net and net.delta_pct is not None and kind in ("network_latency", "network_partition"):
-            if net.delta_pct < -60:
-                score -= 30
-            elif net.delta_pct < -30:
-                score -= 15
-            elif net.delta_pct < -10:
-                score -= 8
-
-        # ── 6. Any SLO threshold breach ───────────────────────────────
+        # ── SLO threshold breaches ────────────────────────────────────
         for d in deltas:
-            if d.breached_threshold and d.metric != "availability_pct":
+            if d.breached_threshold:
                 score -= 15
 
         return max(0, min(100, score))
